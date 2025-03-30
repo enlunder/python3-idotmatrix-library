@@ -1,9 +1,10 @@
+from typing import Union, List
 from ..connectionManager import ConnectionManager
 import logging
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
 from typing import Tuple, Optional, Union
 import zlib
-
 
 class Text:
     """Manages text processing and packet creation for iDotMatrix devices. With help from https://github.com/8none1/idotmatrix/ :)"""
@@ -46,17 +47,32 @@ class Text:
             )
             if self.conn:
                 await self.conn.connect()
-                await self.conn.send(data=data)
+                chunks = self._splitIntoChunks(data, 512)
+                for chunk in chunks:
+                    await self.conn.send(data=chunk)
+                    #await self.conn.send(data=data)
             return data
         except BaseException as error:
             self.logging.error(f"could send the text to the device: {error}")
             return False
+        
+    def _splitIntoChunks(self, data: bytearray, chunk_size: int) -> List[bytearray]:
+        """Split the data into chunks of specified size.
+
+        Args:
+            data (bytearray): data to split into chunks
+            chunk_size (int): size of the chunks
+
+        Returns:
+            List[bytearray]: returns list with chunks of given data input
+        """
+        return [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
 
     def _buildStringPacket(
         self,
         text_bitmaps: bytearray,
         text_mode: int = 1,
-        speed: int = 95,
+        speed: int = 96,
         text_color_mode: int = 1,
         text_color: Tuple[int, int, int] = (255, 0, 0),
         text_bg_mode: int = 0,
@@ -123,31 +139,72 @@ class Text:
 
         return header + packet
 
-    def _StringToBitmaps(
-        self, text: str, font_path: Optional[str] = None, font_size: Optional[int] = 20
-    ) -> bytearray:
-        """Converts text to bitmap images suitable for iDotMatrix devices."""
-        if not font_path:
-            # using open source font from https://www.fontspace.com/rain-font-f22577
-            font_path = "./fonts/Rain-DRM3.otf"
+    def _ConstructBitMap(self, image: Image):
+        """Converts screen images (16x32) to bitmap images suitable for iDotMatrix devices."""
+        bitmap = bytearray()
+        for y in range(32):
+            for x in range(16):
+                if x % 8 == 0:
+                    byte = 0
+                pixel = image.getpixel((x, y))
+                byte |= (pixel & 1) << (x % 8)
+                if x % 8 == 7:
+                    bitmap.append(byte)
+        
+        return bitmap
+
+    
+    # Pack smaller characters together more tightly in the text module
+    # Fix inspired by zhs628 https://github.com/derkalle4/python3-idotmatrix-client/issues/29#issue-2159220874
+    def _StringToBitmaps(self,text: str,font_path: Optional[str] = None, font_size: Optional[int] = 20) -> bytearray:
+        font_path = font_path or "./fonts/Rain-DRM3.otf"
+        font_size = font_size or 20
         font = ImageFont.truetype(font_path, font_size)
-        byte_stream = bytearray()
-        for char in text:
-            # todo make image the correct size for 16x16, 32x32 and 64x64
-            image = Image.new("1", (self.image_width, self.image_height), 0)
-            draw = ImageDraw.Draw(image)
-            _, _, text_width, text_height = draw.textbbox((0, 0), text=char, font=font)
-            text_x = (self.image_width - text_width) // 2
-            text_y = (self.image_height - text_height) // 2
-            draw.text((text_x, text_y), char, fill=1, font=font)
-            bitmap = bytearray()
-            for y in range(self.image_height):
-                for x in range(self.image_width):
-                    if x % 8 == 0:
-                        byte = 0
-                    pixel = image.getpixel((x, y))
-                    byte |= (pixel & 1) << (x % 8)
-                    if x % 8 == 7 or x == self.image_width - 1:
-                        bitmap.append(byte)
-            byte_stream.extend(self.separator + bitmap)
-        return byte_stream
+
+        char_images = []
+        bbox = font.getbbox("6") # :TODO: should figure out how to get good widths
+        
+        char_width = bbox[2] - bbox[0]
+        ascent, descent  = font.getmetrics()
+        char_height = ascent + descent  
+        
+        total_width = 0
+        for c in text: # :TODO: should support variable widths 
+            char_image = Image.new("1", (char_width, 32), 0)            
+            draw = ImageDraw.Draw(char_image)
+            draw.text((0, 0), c, fill=1, font=font)
+            char_images.append(char_image)
+            total_width = total_width + char_width 
+
+        # Make the width of final image evenly divisible by 16
+        padded_width = total_width + (-total_width % 16) 
+        
+        width, height = char_images[0].size
+
+        full_image = Image.new('1', (padded_width, 32), color=0)  # 0: black
+    
+        x = 0
+        y =  (16 - char_height // 2) # Center text vertically
+
+        for i, char in enumerate(char_images):
+            full_image.paste(char, (x, y))
+            x = x + width
+
+        left = 0
+        i=0
+        results = []
+
+        while left < padded_width:
+            result = full_image.crop((left, 0, left+16, 32))
+#            result.save(f"characters_%s.png"%i)
+            i = i + 1
+            results.append( self._ConstructBitMap(result) )
+            left = left + 16
+
+        bytestream = bytearray()
+        
+        for bitmap in results:
+            bytestream = bytestream + b"\x05\xff\xff\xff" + bitmap
+        
+        return bytestream
+    

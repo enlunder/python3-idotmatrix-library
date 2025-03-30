@@ -5,7 +5,6 @@ import logging
 from PIL import Image as PilImage
 import struct
 
-
 class Image:
     logging = logging.getLogger(__name__)
 
